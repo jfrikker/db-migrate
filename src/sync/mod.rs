@@ -21,10 +21,32 @@ pub trait Transaction {
     fn save_migration(&self, info: &ExecutedMigrationInfo) -> Result<(), Self::Err>;
 }
 
-pub trait Migrations {
-    type C: Connection;
+pub struct Migration<T, E> {
+    version: String,
+    name: String,
+    f: Box<dyn FnMut(&T) -> Result<(), E>>
+}
 
-    fn all_migrations(&self) -> Vec<MigrationInfo>;
+impl <T, E> Migration<T, E> {
+    pub fn new<V, N, F>(version: V, name: N, f: F) -> Migration<T, E>
+        where V: Into<String>,
+              N: Into<String>,
+              F: FnMut(&T) -> Result<(), E> + 'static {
+        Migration {
+            version: version.into(),
+            name: name.into(),
+            f: Box::new(f)
+        }
+    }
+}
+
+impl <T, E> Into<MigrationInfo> for Migration<T, E> {
+    fn into(self) -> MigrationInfo {
+        MigrationInfo {
+            version: self.version,
+            name: self.name
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -39,14 +61,13 @@ impl <E> From<E> for MigrationError<E> {
     }
 }
 
-type MigrationState = Vec<(Option<MigrationInfo>, Option<ExecutedMigrationInfo>)>;
+type MigrationState<T, E> = Vec<(Option<Migration<T, E>>, Option<ExecutedMigrationInfo>)>;
 
-pub fn migrate<C, T, E, M>(conn: &C, migrations: &M) -> Result<(), MigrationError<E>>
+pub fn migrate<C, T, E>(conn: &C, migrations: Vec<Migration<T, E>>) -> Result<(), MigrationError<E>>
     where T: Transaction<Err = E>,
-          C: Connection<Trans = T, Err = E>,
-          M: Migrations<C = C> {
+          C: Connection<Trans = T, Err = E> {
     conn.ensure_migration_table()?;
-    let available: HashMap<String, MigrationInfo> = migrations.all_migrations().into_iter()
+    let available: HashMap<String, Migration<T, E>> = migrations.into_iter()
         .map(|m| (m.version.clone(), m))
         .collect();
     let existing: HashMap<String, ExecutedMigrationInfo> = conn.load_existing_migrations()?.into_iter()
@@ -72,7 +93,7 @@ fn merge<K: Eq + Hash, V1, V2>(m1: HashMap<K, V1>, m2: HashMap<K, V2>) -> HashMa
     result
 }
 
-fn check_unexpected_migrations<E>(migration_state: &MigrationState) -> Result<(), MigrationError<E>> {
+fn check_unexpected_migrations<T, E>(migration_state: &MigrationState<T, E>) -> Result<(), MigrationError<E>> {
     let mut unexpected_migrations: Vec<MigrationInfo> = migration_state.iter()
         .filter(|(a, _)| a.is_none())
         .map(|(_, e)| e.as_ref().unwrap().migration.clone())
@@ -82,41 +103,6 @@ fn check_unexpected_migrations<E>(migration_state: &MigrationState) -> Result<()
         return Err(MigrationError::UnexpectedMigrations(unexpected_migrations));
     }
     Ok(())
-}
-
-pub struct MigrationsBuilder<C, E> {
-    migrations: HashMap<String, (MigrationInfo, Box<dyn FnOnce(C) -> Result<(), E>>)>
-}
-
-impl <C, E> MigrationsBuilder<C, E> {
-    pub fn new() -> MigrationsBuilder<C, E> {
-        MigrationsBuilder {
-            migrations: HashMap::new()
-        }
-    }
-
-    pub fn add_migration<V, S, F>(&mut self, version: V, name: S, f: F)
-        where V: Into<String>,
-              S: Into<String>,
-              F: FnOnce(C) -> Result<(), E> + 'static {
-        let version = version.into();
-        let migration = MigrationInfo {
-            version: version.clone(),
-            name: name.into()
-        };
-        self.migrations.insert(version, (migration, Box::new(f)));
-    }
-}
-
-impl <C, E> Migrations for MigrationsBuilder<C, E>
-    where C: Connection<Err = E> {
-    type C = C;
-
-    fn all_migrations(&self) -> Vec<MigrationInfo> {
-        self.migrations.values()
-            .map(|(m, _)| m.clone())
-            .collect()
-    }
 }
 
 #[cfg(test)]
@@ -146,8 +132,9 @@ mod tests {
     fn non_existent_migrations() {
         let connection = rusqlite::Connection::open_in_memory().unwrap();
 
-        let mut migrations: MigrationsBuilder<rusqlite::Connection, rusqlite::Error> = MigrationsBuilder::new();
-        migrations.add_migration("1.0.0", "test_migration", |_| Ok(()));
+        let migrations = vec!(
+            Migration::new("1.0.0", "test_migration", |_| Ok(()))
+        );
         connection.ensure_migration_table().unwrap();
         connection.in_transaction(|t| {
             t.save_migration(&executed_migration(1, "0.0.1", "fake1"))?;
@@ -156,7 +143,7 @@ mod tests {
             Ok(())
         }).unwrap();
 
-        let actual = migrate(&connection, &migrations);
+        let actual = migrate(&connection, migrations);
         match actual {
             Err(MigrationError::UnexpectedMigrations(m)) => assert_eq!(vec!(
                     migration("0.0.1", "fake1"),
