@@ -1,5 +1,4 @@
-use std::str::FromStr;
-use super::super::{ExecutedMigrationInfo, MigrationInfo, Version};
+use super::super::{ExecutedMigrationInfo, MigrationInfo};
 
 impl super::Connection for rusqlite::Connection {
     type Err = rusqlite::Error;
@@ -20,11 +19,10 @@ impl super::Connection for rusqlite::Connection {
     fn load_existing_migrations(&self) -> Result<Vec<ExecutedMigrationInfo>, Self::Err> {
         self.prepare("SELECT sequence, version, name, applied_at FROM migration")?
             .query_map(rusqlite::NO_PARAMS, |row| {
-                let version_str: String = row.get(1);
                 ExecutedMigrationInfo {
                     sequence: row.get(0),
                     migration: MigrationInfo {
-                        version: Version::from_str(&version_str).unwrap(),
+                        version: row.get(1),
                         name: row.get(2)
                     }
                 }

@@ -2,7 +2,8 @@ pub mod sqlite;
 
 use std::collections::HashMap;
 use std::hash::Hash;
-use super::{ExecutedMigrationInfo, MigrationInfo, ParseVersionError, Version};
+use super::{ExecutedMigrationInfo, MigrationInfo};
+use super::types::compare_versions;
 
 pub trait Connection {
     type Err;
@@ -45,10 +46,10 @@ pub fn migrate<C, T, E, M>(conn: &C, migrations: &M) -> Result<(), MigrationErro
           C: Connection<Trans = T, Err = E>,
           M: Migrations<C = C> {
     conn.ensure_migration_table()?;
-    let available: HashMap<Version, MigrationInfo> = migrations.all_migrations().into_iter()
+    let available: HashMap<String, MigrationInfo> = migrations.all_migrations().into_iter()
         .map(|m| (m.version.clone(), m))
         .collect();
-    let existing: HashMap<Version, ExecutedMigrationInfo> = conn.load_existing_migrations()?.into_iter()
+    let existing: HashMap<String, ExecutedMigrationInfo> = conn.load_existing_migrations()?.into_iter()
         .map(|m| (m.migration.version.clone(), m))
         .collect();
 
@@ -76,7 +77,7 @@ fn check_unexpected_migrations<E>(migration_state: &MigrationState) -> Result<()
         .filter(|(a, _)| a.is_none())
         .map(|(_, e)| e.as_ref().unwrap().migration.clone())
         .collect();
-    unexpected_migrations.sort_unstable_by(|m1, m2| m1.version.cmp(&m2.version));
+    unexpected_migrations.sort_unstable_by(|m1, m2| compare_versions(&m1.version, &m2.version));
     if !unexpected_migrations.is_empty() {
         return Err(MigrationError::UnexpectedMigrations(unexpected_migrations));
     }
@@ -84,7 +85,7 @@ fn check_unexpected_migrations<E>(migration_state: &MigrationState) -> Result<()
 }
 
 pub struct MigrationsBuilder<C, E> {
-    migrations: HashMap<Version, (MigrationInfo, Box<dyn FnOnce(C) -> Result<(), E>>)>
+    migrations: HashMap<String, (MigrationInfo, Box<dyn FnOnce(C) -> Result<(), E>>)>
 }
 
 impl <C, E> MigrationsBuilder<C, E> {
@@ -94,17 +95,16 @@ impl <C, E> MigrationsBuilder<C, E> {
         }
     }
 
-    pub fn add_migration<V, S, F>(&mut self, version: V, name: S, f: F) -> Result<(), ParseVersionError>
+    pub fn add_migration<V, S, F>(&mut self, version: V, name: S, f: F)
         where V: Into<String>,
               S: Into<String>,
               F: FnOnce(C) -> Result<(), E> + 'static {
-        let version: Version = version.into().parse()?;
+        let version = version.into();
         let migration = MigrationInfo {
             version: version.clone(),
             name: name.into()
         };
         self.migrations.insert(version, (migration, Box::new(f)));
-        Ok(())
     }
 }
 
@@ -147,12 +147,12 @@ mod tests {
         let connection = rusqlite::Connection::open_in_memory().unwrap();
 
         let mut migrations: MigrationsBuilder<rusqlite::Connection, rusqlite::Error> = MigrationsBuilder::new();
-        migrations.add_migration("1.0.0", "test_migration", |_| Ok(())).unwrap();
+        migrations.add_migration("1.0.0", "test_migration", |_| Ok(()));
         connection.ensure_migration_table().unwrap();
         connection.in_transaction(|t| {
             t.save_migration(&executed_migration(1, "0.0.1", "fake1"))?;
             t.save_migration(&executed_migration(2, "0.0.2", "fake2"))?;
-            t.save_migration(&executed_migration(3, "0.0.3", "fake3"))?;
+            t.save_migration(&executed_migration(3, "0.0.10", "fake3"))?;
             Ok(())
         }).unwrap();
 
@@ -161,7 +161,7 @@ mod tests {
             Err(MigrationError::UnexpectedMigrations(m)) => assert_eq!(vec!(
                     migration("0.0.1", "fake1"),
                     migration("0.0.2", "fake2"),
-                    migration("0.0.3", "fake3")
+                    migration("0.0.10", "fake3")
                 ),
                 m),
             o => panic!("Unexpected result {:?}", o)
